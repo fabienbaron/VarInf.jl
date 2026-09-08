@@ -1,0 +1,11 @@
+Manifest.toml
+*.cov
+deps/deps.jl
+docs/build/
+docs/site/
+.DS_Store
+# generated outputs from example scripts
+examples/*.fits
+examples/*.png
+examples/*.gif
+comparison/
