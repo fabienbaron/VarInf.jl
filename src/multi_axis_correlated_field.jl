@@ -72,9 +72,16 @@ lognormal field `exp(mcf(z))`, set `offset_mean = log(prior-mean level)`.
 
 !!! note "Omitting `offset_prior`"
     With `offset_prior=nothing` there is no additive offset and the composite
-    DC of the fluctuation kernel stays at 1 (each per-axis DC is normalised to
-    1 by `_normalize_axis_dc`), i.e. a small zero-mean random DC mode. Pass
-    `offset_prior` whenever you need to control/center the field's level.
+    DC of the fluctuation kernel is pinned at 1, i.e. a small zero-mean random
+    DC mode (field variance `1/P`). Pass `offset_prior` whenever you need to
+    control/center the field's level.
+
+    This is deliberately *not* NIFTy parity: NIFTy's unit-variance DC would be
+    `√P` here, and NIFTy's own "no zero-mode" path (`azm = 0`) masks the DC to
+    0 and raises for product spectra. The per-axis DC values are NIFTy's
+    (`√N_i`, see `_normalize_axis_dc`); only this one composite entry is
+    VarInf's own convention, so the marginal-DC modes carry NIFTy's power while
+    callers that project the mean out keep the behaviour they had.
     (OIVI's `sky_model.jl` uses `offset_prior=nothing` and projects out the
     field mean via a separate masking step.)
 """
@@ -243,17 +250,40 @@ function _reshape_for_axis(piece::AbstractArray, mcf::CorrelatedField, i::Int)
     return reshape(piece, target...)
 end
 
-# Make a copy of the per-axis amp with amp[1] := 1, so the outer-product
-# kernel has unit amplitude along each axis's DC slice. Without this
-# substitution, the legacy `amplitude_spectrum` convention `amp[1] = npix²`
-# bleeds through to every marginal-DC mode (e.g. (k_spatial=0, k_freq≠0))
-# and the multi-axis kernel blows up by a factor `prod(npix_i^2)` at those
-# modes, making `exp(field)` astronomical.
-function _normalize_axis_dc(amp_per_axis::AbstractVector{<:AbstractVector})
+# Make a copy of the per-axis amp with amp[1] replaced by the DC value the
+# composition convention requires, so the legacy `amplitude_spectrum` DC
+# (`N`, a deliberately large "free mean" placeholder) does not bleed into
+# every marginal-DC mode of the outer product (e.g. (k_spatial=0, k_freq≠0))
+# and blow the kernel up there.
+#
+# The replacement is `√N_i`, N_i = sum(mode_multiplicity) of axis i, NOT 1.
+#
+# Why. A marginal-DC mode like (k_1 = 0, k_2 ≠ 0) is a pattern constant along
+# axis 1 and varying along axis 2, so it should carry axis 2's full fluctuation
+# power — axis 1 contributing a factor of exactly 1 *after* the transform's
+# normalisation, not before it. In NIFTy that is `amp_i[0] = total_volume_i`,
+# divided out by `harmonic_dvol = 1/total_volume_i`; in VarInf's mode-count
+# convention the same thing is `√N_i` (the conversion between the two
+# amplitude conventions is `√N / total_volume`; see `_amp_norm_scale`).
+#
+# With `a_i[1] = 1` instead, each marginal-DC slice was suppressed by `1/N_j`
+# for every OTHER axis j, so a 2-D × 1-D field had marginal power
+# `fluct²/N_other` instead of `fluct²`. Measured against NIFTy (two 1-D axes,
+# azm pinned to 1): NIFTy gives `√(f1²f2² + f1² + f2²)` — 0.659 and 0.674 for
+# f = (0.5, 0.4) — while VarInf gave 0.285 / 0.257, low by 2.3–2.7×. The
+# product term `f1²f2²` was already right; only the marginal terms were wrong.
+# Fixed 2026-10-31 together with `_amp_norm_scale`; see
+# `test_amplitude_normalization.jl` and `comparison/step11_*`.
+#
+# The *composite* DC (all k_i = 0) is NOT left to this outer product: it is set
+# explicitly in `_build_amp_kernel` (`azm·√P` with `use_offset`, else the
+# documented 1), so changing this value does not change the single-axis case.
+function _normalize_axis_dc(amp_per_axis::AbstractVector{<:AbstractVector},
+                            mcf::CorrelatedField)
     out = similar(amp_per_axis)
     for i in eachindex(amp_per_axis)
         a = copy(amp_per_axis[i])
-        a[1] = one(eltype(a))
+        a[1] = sqrt(eltype(a)(sum(mcf.grids[i].mode_multiplicity)))
         out[i] = a
     end
     return out
@@ -264,7 +294,7 @@ end
 
 Build the multi-D amplitude kernel as the outer product of per-axis
 amplitude vectors indexed via each axis's `bin_index`. Each axis's DC
-bin is normalised to 1 first (see `_normalize_axis_dc`). The composite
+bin is replaced by `√N_i` first (see `_normalize_axis_dc`). The composite
 DC mode is then 1 (when `mcf.use_offset == false`) or, with `use_offset`,
 the lognormal zero-mode amplitude `azm·√P` (azm = `exp(azm_logmean +
 azm_logstd·xi_offset)`), so `xi_offset` is used here (it drives azm); the
@@ -273,34 +303,44 @@ additive `offset_mean` is added separately in the forward.
 function _build_amp_kernel(amp_per_axis::AbstractVector{<:AbstractVector},
                             mcf::CorrelatedField, xi_offset::Real)
     T = eltype(mcf)
-    a = _normalize_axis_dc(amp_per_axis)
+    a = _normalize_axis_dc(amp_per_axis, mcf)
     pieces = [a[i][mcf.grids[i].bin_index] for i in 1:mcf.n_axes]
     amp_kernel = _reshape_for_axis(pieces[1], mcf, 1)
     for i in 2:mcf.n_axes
         amp_kernel = amp_kernel .* _reshape_for_axis(pieces[i], mcf, i)
     end
     amp_kernel = Array(amp_kernel)
+    # The composite DC is set explicitly, never left to the outer product of the
+    # per-axis DC values (which is `√P`, the NIFTy-parity unit-variance DC).
+    dc_idx = CartesianIndex(ntuple(_ -> 1, length(mcf.field_shape))...)
     if mcf.use_offset
         # Zero-mode amplitude = azm·√P (azm = lognormal from the offset latent), so the
-        # field DC fluctuation is azm·N(0,1) (matches NIFTy's azm·xi[DC]); the additive
-        # offset_mean is added in the forward. (NIFTy's azm divides out of the non-DC
-        # bins and survives only at the DC, so it lives entirely in this one entry.)
-        dc_idx = CartesianIndex(ntuple(_ -> 1, length(mcf.field_shape))...)
+        # field DC fluctuation is azm·N(0,1); the additive offset_mean is added in the
+        # forward. Note √P == prod(√N_i), i.e. exactly what the per-axis DC values
+        # would have produced for azm = 1 — the two paths agree by construction.
         azm = exp(mcf.azm_logmean + mcf.azm_logstd * xi_offset)
         amp_kernel[dc_idx] = azm * sqrt(T(prod(mcf.field_shape)))
+    else
+        # Documented `offset_prior = nothing` contract: a small zero-mean DC mode
+        # (variance 1/P in the field), so callers that project the mean out are
+        # unaffected. This is a VarInf-specific middle ground: NIFTy's own
+        # "no zero-mode" path masks the DC to 0 and REFUSES product spectra
+        # ("Zeromode can not be disabled for product spectra").
+        amp_kernel[dc_idx] = one(T)
     end
     return amp_kernel
 end
 
 # Same idea, but builds the JVP tangent of `amp_kernel` via the product rule:
 # d_amp_kernel = Σ_i (outer product where axis i is replaced by its tangent).
-# Per-axis amp[1] is treated as a constant (1, after _normalize_axis_dc) ⇒
-# d_amp[1] = 0 from amplitude_spectrum_jvp already, no override needed.
+# Per-axis amp[1] is a CONSTANT (√N_i, after _normalize_axis_dc) ⇒ d_amp[1] = 0
+# from amplitude_spectrum_jvp already, so every product-rule term vanishes at a
+# marginal-DC index where it would need d_amp_i[1].
 function _build_d_amp_kernel(amp_per_axis, d_amp_per_axis,
                               mcf::CorrelatedField,
                               xi_offset::Real, v_offset::Real)
     T = eltype(mcf)
-    a = _normalize_axis_dc(amp_per_axis)
+    a = _normalize_axis_dc(amp_per_axis, mcf)
     pieces = [a[i][mcf.grids[i].bin_index] for i in 1:mcf.n_axes]
     d_pieces = [d_amp_per_axis[i][mcf.grids[i].bin_index] for i in 1:mcf.n_axes]
     d_amp_kernel = zeros(T, mcf.field_shape)
@@ -313,12 +353,15 @@ function _build_d_amp_kernel(amp_per_axis, d_amp_per_axis,
         end
         d_amp_kernel .+= term
     end
+    # Mirror the forward's explicit composite DC in both branches.
+    dc_idx = CartesianIndex(ntuple(_ -> 1, length(mcf.field_shape))...)
     if mcf.use_offset
         # d(azm·√P)/dξ_azm = azm·σ·√P (chain rule of exp); the DC tangent flows
         # through the ifft product rule, not as a separate additive term.
-        dc_idx = CartesianIndex(ntuple(_ -> 1, length(mcf.field_shape))...)
         azm = exp(mcf.azm_logmean + mcf.azm_logstd * xi_offset)
         d_amp_kernel[dc_idx] = azm * mcf.azm_logstd * v_offset * sqrt(T(prod(mcf.field_shape)))
+    else
+        d_amp_kernel[dc_idx] = zero(T)   # composite DC pinned at the constant 1
     end
     return d_amp_kernel
 end
@@ -448,7 +491,7 @@ function mcf_vjp(mcf::CorrelatedField, z::AbstractVector{<:Real},
     # Per-axis VJP: contract g_amp_kernel_z with the product of the OTHER
     # axes' amp pieces, then sum-reduce over each axis's dims into the
     # axis's bin_index. (Use the same DC-normalised amps as the forward.)
-    a_norm = _normalize_axis_dc(amp_per_axis)
+    a_norm = _normalize_axis_dc(amp_per_axis, mcf)
     pieces = [a_norm[i][mcf.grids[i].bin_index] for i in 1:mcf.n_axes]
     g_amp_per_axis = Vector{Vector{T}}(undef, mcf.n_axes)
     # One reusable buffer for the per-axis weighted product (allocated once)

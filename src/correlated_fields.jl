@@ -63,7 +63,7 @@ Base.eltype(::CorrFieldConfig{T}) where {T} = T
 Construct from `(mean, std)` prior tuples.
 - `flex_prior = nothing` (default) disables the integrated Wiener process layer.
 - `offset_prior = nothing` (default) keeps the legacy DC-bin convention
-  `amplitude[1] = npix²`, which is convenient for masked / interferometric
+  `amplitude[1] = N` (the harmonic-mode count), which is convenient for masked / interferometric
   applications that already kill the mean elsewhere (e.g. via a limb-darkened
   disk weight + zero-mean projection in `OIVI`). For new applications that
   want to control the DC mode explicitly, pass `offset_prior=(mean, std)`.
@@ -482,6 +482,19 @@ end
 Compute the radial amplitude spectrum from latent variables.
 Prior hyperparameters come from `cfg`; Fourier grid data from `p`.
 
+The non-DC bins are normalised so that a field synthesised as
+`real(ifft(fft(xi) .* amp))` from white `xi` has **per-pixel standard deviation
+`fluct`**, independent of the grid's size and dimension:
+
+```
+sum_{b >= 2} mode_multiplicity[b] * amplitude[b]^2 == fluct^2 * N,
+N == sum(mode_multiplicity)      # the number of harmonic modes
+```
+
+which is NIFTy's guarantee for `fluctuations` expressed in VarInf's transform
+normalisation (NIFTy scales by `total_volume` and divides it out in synthesis;
+Julia's `ifft` divides by `N` instead). See `_amp_norm_scale`.
+
 !!! warning "A learned amplitude is Neal's funnel"
     The NIFTy-style construction this implements — `amp = f(hyper-latents)` and
     then `y = amp ⊙ ξ` with `ξ ~ N(0,1)` — is a non-centred hierarchical model,
@@ -517,19 +530,60 @@ Prior hyperparameters come from `cfg`; Fourier grid data from `p`.
     [`amplitude_spectrum_adjoint`] use only five fields of `p`: `npix`,
     `n_bins`, `mode_multiplicity`, `rel_log_mode_lengths` and `log_volume`.
     Anything supplying those works, so a new harmonic geometry needs no changes
-    here. Spherical harmonics, for instance, are one bin per degree ℓ with
+    here. Of those, `npix` is read *only* by the legacy `use_offset == false`
+    DC bin below; the variance-carrying normalisation goes through
+    `sum(mode_multiplicity)`, so it is correct on any geometry without a
+    per-dimension special case.
+
+    Spherical harmonics, for instance, are one bin per degree ℓ with
     multiplicity `2ℓ+1` and `rel_log_mode_lengths = log ℓ`, which matches NIFTy
     exactly (`LMSpace.get_k_length_array()` returns ℓ and `PowerSpace`'s `rho`
     is `2ℓ+1`). [`FourierGridInfo`] and [`Axis1DInfo`] are the two shipped
     implementations.
 
 The DC bin (`amplitude[1]`) behavior depends on `cfg.use_offset`:
-- `cfg.use_offset == false` (legacy): `amplitude[1] = npix²`. Appropriate when
+- `cfg.use_offset == false` (legacy): `amplitude[1] = N`. Appropriate when
   the caller projects the field's mean to zero downstream (e.g. via a mask).
+  This bin is deliberately *not* part of the variance normalisation above — it
+  is a large "free mean" placeholder. It was spelled `npix²`, which equals `N`
+  on a [`FourierGridInfo`] but `N²` on an [`Axis1DInfo`]; it is now `N` on both,
+  so no DC value in this file depends on the grid's dimension. That is a no-op
+  for 2-D callers, and the other two DC paths replace this bin outright
+  ([`CorrelatedField`] substitutes `√N` per axis, and `use_offset = true` the
+  lognormal below). Prefer `offset_prior` for anything new.
 - `cfg.use_offset == true`: `amplitude[1] = exp(offset_mean + offset_std · xi_offset)`,
   i.e. a lognormal prior on the DC amplitude. The `xi_offset` latent is
   passed by keyword so existing callers don't need to change.
 """
+# Normalisation scale for the non-DC amplitude bins.
+#
+# `CorrelatedField` synthesises a field as `real(ifft(fft(xi) .* amp_kernel))`,
+# and Julia's `ifft` carries the 1/N factor, so for white `xi` on N pixels
+# Parseval gives
+#     var(field) = (1/N) * sum_modes amp^2.
+# `amplitude_spectrum` normalises so that
+#     sum_{non-DC} mult[b]*amp[b]^2 == fluct^2 * _amp_norm_scale(T, p)^2,
+# hence the scale must be sqrt(N) for `std(field) == fluct`, which is the
+# property `fluct_prior` is documented to set.
+#
+# `sum(mode_multiplicity)` IS that N -- the number of harmonic modes -- and it
+# is duck-typed across geometries: `npix^2` for `FourierGridInfo`, `npix` for
+# `Axis1DInfo`, `sum(2l+1) = (lmax+1)^2` for spherical harmonics.
+#
+# It must NOT be `p.npix`. That happens to equal sqrt(N) only for the square
+# 2-D grid; on a 1-D axis it over-disperses the field by sqrt(npix), and a
+# multi-axis field by sqrt(npix) for each 1-D axis it carries. That was the
+# behaviour before 2026-10-31; see `test_amplitude_normalization.jl`.
+#
+# Relation to NIFTy: NIFTy normalises to `fluct*totvol` and divides by `totvol`
+# in synthesis (`harmonic_dvol = 1/totvol` against an unnormalised Hartley),
+# which also yields `var(field) = fluct^2`. An amplitude expressed in NIFTy's
+# convention therefore converts to this one by a factor `sqrt(N)/total_volume`
+# -- relevant to [`matern_amplitude`], which is a literal port and so carries
+# NIFTy's convention, not this one.
+_amp_norm_scale(::Type{T}, p) where {T<:AbstractFloat} =
+    sqrt(T(sum(p.mode_multiplicity)))
+
 function amplitude_spectrum(xi_slope::Real, xi_fluct::Real,
                             xi_flex::Real, xi_asp::Real,
                             xi_spectrum::AbstractMatrix{<:Real},
@@ -539,7 +593,15 @@ function amplitude_spectrum(xi_slope::Real, xi_fluct::Real,
     n_bins = p.n_bins
     rel_log = p.rel_log_mode_lengths
     mult = p.mode_multiplicity
-    n2 = T(p.npix)^2
+    # Legacy DC placeholder (`use_offset == false`): the number of harmonic
+    # modes N. Unlike the non-DC bins this is not a variance-carrying
+    # normalisation -- it is a deliberately large "free mean" value for callers
+    # that project the field mean out downstream. It was `npix^2`, which IS N
+    # on a square 2-D grid but N^2 on a 1-D axis; `sum(mode_multiplicity)` is
+    # the same conflation-free quantity used by `_amp_norm_scale`, so the value
+    # no longer depends on the grid's dimension. (No-op for every 2-D caller,
+    # and both other DC paths replace this bin outright.)
+    dc_legacy = T(sum(p.mode_multiplicity))
 
     slope = cfg.slope_mean + cfg.slope_std * xi_slope
     fluct = exp(cfg.fluct_mean + cfg.fluct_std * xi_fluct)
@@ -560,11 +622,11 @@ function amplitude_spectrum(xi_slope::Real, xi_fluct::Real,
     norm_sq = sum(mult[b] * A[b]^2 for b in 2:n_bins)
     norm = sqrt(norm_sq)
 
-    npx = T(p.npix)
+    npx = _amp_norm_scale(T, p)
     amplitude = Vector{T}(undef, n_bins)
     amplitude[1] = cfg.use_offset ?
                     exp(cfg.offset_mean + cfg.offset_std * xi_offset) :
-                    n2
+                    dc_legacy
     for b in 2:n_bins
         amplitude[b] = fluct * npx / norm * A[b]
     end
@@ -612,7 +674,7 @@ function amplitude_spectrum_adjoint(g_amp::AbstractVector{<:Real},
     n_bins = p.n_bins
     rel_log = p.rel_log_mode_lengths
     mult = p.mode_multiplicity
-    npx = T(p.npix)
+    npx = _amp_norm_scale(T, p)
 
     slope = cfg.slope_mean + cfg.slope_std * xi_slope
     fluct = exp(cfg.fluct_mean + cfg.fluct_std * xi_fluct)
@@ -676,7 +738,7 @@ function amplitude_spectrum_adjoint(g_amp::AbstractVector{<:Real},
     end
 
     # Offset latent: amp[1] = exp(offset_mean + offset_std·xi_offset) when use_offset,
-    # else amp[1] is a constant (npix²) ⇒ no latent dependence.
+    # else amp[1] is a constant (N) ⇒ no latent dependence.
     g_xi_offset = if cfg.use_offset
         offset_val = exp(cfg.offset_mean + cfg.offset_std * xi_offset)
         g_amp[1] * offset_val * cfg.offset_std
@@ -709,7 +771,7 @@ function amplitude_spectrum_jvp(v_slope::Real, v_fluct::Real,
     n_bins = p.n_bins
     rel_log = p.rel_log_mode_lengths
     mult = p.mode_multiplicity
-    npx = T(p.npix)
+    npx = _amp_norm_scale(T, p)
 
     slope = cfg.slope_mean + cfg.slope_std * xi_slope
     fluct = exp(cfg.fluct_mean + cfg.fluct_std * xi_fluct)
@@ -774,6 +836,12 @@ end
 # counts: a cutoff mode is a positive length scale, a spectral index may be
 # negative. This port follows the code.
 #
+# NORMALISATION: the spectrum shape, the priors and the `:power` sqrt are
+# NIFTy's; the overall scale is converted to VarInf's synthesis convention by
+# `_matern_scale` (`√N / total_volume`) and the zero mode is VarInf's `N`
+# placeholder, so the result is directly usable by `CorrelatedField`. See the
+# note on `matern_amplitude`.
+#
 # `renormalize_amplitude` is deliberately NOT ported. Upstream emits
 # `logger.warning("Renormalize amplidude is not yet tested!")` for that branch,
 # and its normalization couples all three hyperparameter derivatives, so porting
@@ -793,12 +861,38 @@ matching NIFTy's code (see the note above about its docstring). The spectrum is
 
 ```
 ln A(k) = 0.25 · loglogslope · log1p((k / cutoff)²)
-A(k)    = scale · √total_volume · exp(ln A(k))
-A(k₀)   = total_volume                            (zero mode, set exactly)
+A(k)    = scale · √total_volume · exp(ln A(k)) · √N / total_volume
+        = scale · exp(ln A(k)) · √(N / total_volume)
+A(k₀)   = N                                       (zero mode, set exactly)
 ```
+
+where `N = sum(mode_multiplicity)`. The `√N / total_volume` factor converts
+NIFTy's normalisation to VarInf's; see the note below.
 
 and for `kind = :power` the whole vector is square-rooted afterwards, so the
 Matérn kernel then describes the *power* spectrum rather than the amplitude.
+
+!!! note "Normalisation is VarInf's, the spectrum shape and priors are NIFTy's"
+    The Matérn curve, the three priors and the `:power` square root are NIFTy's
+    exactly. The overall normalisation is **converted** to VarInf's synthesis
+    convention (`√N / total_volume`, see `_matern_scale`), so this vector drops
+    straight into [`CorrelatedField`]'s kernel and into any code that already
+    consumes [`amplitude_spectrum`].
+
+    Previously it carried NIFTy's `total_volume` scale verbatim, which made it
+    unusable in VarInf's `ifft`-based synthesis without an external correction
+    of `√N / total_volume` -- a factor of 16, 1/16 and 0.301 on three ordinary
+    grids. To recover the literal NIFTy amplitude, multiply by
+    `total_volume / √N`; `test_matern.jl` pins parity that way.
+
+    Two further deliberate deviations from upstream, both documented at the
+    definition: the zero mode is `N` (VarInf's DC placeholder, and `:power` does
+    not square-root it -- upstream sets the zero mode *before* its sqrt, so its
+    `:amplitude` and `:power` zero modes differ by a square root), and
+    `renormalize_amplitude` is not ported. Note `scale` is not the field's
+    standard deviation in any of these conventions: Matérn is an absolute
+    spectrum, not a normalised one, which is what upstream's
+    `renormalize_amplitude` exists to change.
 """
 struct MaternConfig{T<:AbstractFloat}
     scale_mean::T       # log-space (μ, σ) of the lognormal scale prior
@@ -843,9 +937,22 @@ function _matern_terms(r::T) where {T<:AbstractFloat}
     return (log1p(r2), r2 / (1 + r2))
 end
 
+# Convert a NIFTy-convention amplitude to VarInf's synthesis convention.
+#
+# NIFTy normalises amplitudes against `total_volume` and divides it back out in
+# synthesis (`harmonic_dvol = 1/total_volume`); VarInf synthesises through
+# Julia's `ifft`, which divides by `N = sum(mode_multiplicity)` instead. An
+# amplitude therefore converts between the two conventions by `√N / total_volume`
+# -- see `_amp_norm_scale`, which is the same relation seen from the other side.
+#
+# Applied to the FINAL amplitude (after the `:power` square root), because it is
+# the final vector that multiplies ξ in the transform.
+_matern_scale(::Type{T}, p) where {T<:AbstractFloat} =
+    sqrt(T(sum(p.mode_multiplicity))) / T(p.total_volume)
+
 # Shared core, so value / JVP / adjoint cannot drift apart. Returns the
-# pre-zero-mode, pre-sqrt amplitude together with the per-bin terms the
-# derivatives need.
+# pre-zero-mode, pre-sqrt, pre-rescale amplitude in NIFTy's convention,
+# together with the per-bin terms the derivatives need.
 function _matern_core(xi_scale::Real, xi_cutoff::Real, xi_slope::Real,
                       cfg::MaternConfig{T}, p) where {T<:AbstractFloat}
     scale  = exp(cfg.scale_mean + cfg.scale_std * xi_scale)
@@ -872,16 +979,19 @@ Matérn amplitude spectrum over the bins of grid `p`, which must supply
 `mode_lengths` and `total_volume` in addition to the fields
 [`amplitude_spectrum`] needs.
 
-The zero mode `A[1]` is set to `total_volume` exactly (NIFTy's
-`spectrum.at[0].set(totvol)`), so it carries no dependence on the three
-hyperparameter latents; `matern_amplitude_jvp` returns 0 there and
-`matern_amplitude_adjoint` ignores `g_amp[1]`.
+The zero mode `A[1]` is set to `N = sum(mode_multiplicity)` exactly -- the same
+DC placeholder [`amplitude_spectrum`] uses on its legacy path, and unlike the
+non-DC bins it is not square-rooted for `kind = :power`. It carries no
+dependence on the three hyperparameter latents; `matern_amplitude_jvp` returns 0
+there and `matern_amplitude_adjoint` ignores `g_amp[1]`. In the multi-axis path
+[`CorrelatedField`] replaces it with `√N` regardless (`_normalize_axis_dc`).
 """
 function matern_amplitude(xi_scale::Real, xi_cutoff::Real, xi_slope::Real,
                           cfg::MaternConfig{T}, p) where {T<:AbstractFloat}
     A, = _matern_core(xi_scale, xi_cutoff, xi_slope, cfg, p)
-    A[1] = T(p.total_volume)
     cfg.kind_power && (A .= sqrt.(A))
+    A .*= _matern_scale(T, p)
+    A[1] = T(sum(p.mode_multiplicity))      # VarInf's legacy DC placeholder
     return A
 end
 
@@ -918,6 +1028,7 @@ function matern_amplitude_jvp(v_scale::Real, v_cutoff::Real, v_slope::Real,
             dA[i] /= 2 * sqrt(A[i])
         end
     end
+    dA .*= _matern_scale(T, p)   # constant factor ⇒ passes straight through
     dA[1] = zero(T)        # zero mode is a constant
     return dA
 end
@@ -937,8 +1048,9 @@ function matern_amplitude_adjoint(g_amp::AbstractVector{<:Real},
     g_scale  = zero(T)
     g_cutoff = zero(T)
     g_slope  = zero(T)
+    sc = _matern_scale(T, p)
     @inbounds for i in 2:length(A)        # skip the constant zero mode
-        gA = T(g_amp[i])
+        gA = T(g_amp[i]) * sc             # adjoint of the constant rescale
         cfg.kind_power && (gA /= 2 * sqrt(A[i]))
         gA *= A[i]
         g_scale  += gA * cfg.scale_std

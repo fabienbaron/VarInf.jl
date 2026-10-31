@@ -79,4 +79,5 @@ fd_grad_ok(::Type{T}, g::Real, g_fd::Real, energy::Real) where {T<:AbstractFloat
     include("test_minisanity.jl")    # minisanity statistic + hybrid scheduling
     include("test_prior_covariance.jl")  # optional non-unit prior covariance
     include("test_matern.jl")            # Matérn amplitude port (NIFTy.re parity)
+    include("test_amplitude_normalization.jl")  # fluct == field std on any grid
 end

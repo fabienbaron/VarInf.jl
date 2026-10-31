@@ -24,6 +24,22 @@ end
 # The log-space (μ, σ) NIFTy's lognormal_prior uses, recomputed here.
 ln_params(m, s) = (log(m) - log1p((s / m)^2) / 2, sqrt(log1p((s / m)^2)))
 
+# VarInf stores amplitudes in its own synthesis convention: NIFTy normalises
+# against `total_volume` and divides it back out via `harmonic_dvol`, while
+# VarInf synthesises through `ifft`, which divides by `N`. So
+#     A_varinf = A_nifty * sqrt(N) / total_volume
+# applied to the FINAL amplitude (after the `:power` sqrt), with the zero mode
+# replaced by VarInf's `N` DC placeholder. Parity with NIFTy is therefore still
+# pinned exactly here -- through this one documented factor, not by dropping it.
+varinf_scale(p) = sqrt(sum(p.mode_multiplicity)) / Float64(p.total_volume)
+
+function nifty_matern_varinf(p, scale, cutoff, slope; kind=:amplitude)
+    A = nifty_matern(Float64.(p.mode_lengths), Float64(p.total_volume),
+                     scale, cutoff, slope; kind=kind) .* varinf_scale(p)
+    A[1] = sum(p.mode_multiplicity)
+    return A
+end
+
 @testset "Matérn amplitude" begin
     @testset "matches NIFTy's formula ($T, $kind)" for T in (Float32, Float64),
                                                        kind in (:amplitude, :power)
@@ -42,20 +58,27 @@ ln_params(m, s) = (log(m) - log1p((s / m)^2) / 2, sqrt(log1p((s / m)^2)))
             scale  = exp(sm + ss * Float64(xs))
             cutoff = exp(cm + cs * Float64(xc))
             slope  = -4.0 + 1.0 * Float64(xl)
-            ref = nifty_matern(Float64.(p.mode_lengths), Float64(p.total_volume),
-                               scale, cutoff, slope; kind=kind)
+            ref = nifty_matern_varinf(p, scale, cutoff, slope; kind=kind)
             @test maximum(abs.(Float64.(A) .- ref) ./ max.(abs.(ref), 1e-30)) <
                   (T === Float32 ? 1e-4 : 1e-12)
         end
     end
 
-    @testset "zero mode is exactly total_volume ($kind)" for kind in (:amplitude, :power)
+    # VarInf's DC placeholder is N for BOTH kinds -- it is set after the `:power`
+    # square root, unlike upstream, which sets its zero mode before the sqrt and
+    # so ends up with `totvol` for :amplitude but `√totvol` for :power.
+    @testset "zero mode is exactly N ($kind)" for kind in (:amplitude, :power)
         p = FourierGridInfo(8, 1.0)
         cfg = MaternConfig(; scale_prior=(2.0, 0.5), cutoff_prior=(3.0, 1.0),
                              loglogslope_prior=(-4.0, 1.0), kind=kind)
         A = matern_amplitude(0.4, -0.2, 0.3, cfg, p)
-        want = kind === :amplitude ? p.total_volume : sqrt(p.total_volume)
-        @test A[1] ≈ want
+        @test A[1] ≈ sum(p.mode_multiplicity)
+        @test A[1] ≈ 64            # 8x8 grid: N = 64, and total_volume is also 64
+        # Not square-rooted for :power, unlike upstream.
+        @test A[1] ≈ matern_amplitude(0.4, -0.2, 0.3,
+                        MaternConfig(; scale_prior=(2.0, 0.5), cutoff_prior=(3.0, 1.0),
+                                       loglogslope_prior=(-4.0, 1.0),
+                                       kind=:amplitude), p)[1]
         # ...and carries no latent dependence.
         @test matern_amplitude_jvp(1.0, 1.0, 1.0, 0.4, -0.2, 0.3, cfg, p)[1] == 0.0
     end
@@ -70,7 +93,8 @@ ln_params(m, s) = (log(m) - log1p((s / m)^2) / 2, sqrt(log1p((s / m)^2)))
         # At ξ=0 the slope is exactly its normal mean, so A/(scale√V) = exp(0.25·(-4)·u).
         cm, _ = ln_params(3.0, 1.0)
         u = log1p.((p.mode_lengths ./ exp(cm)) .^ 2)
-        pred = exp(sm) * sqrt(p.total_volume) .* exp.(0.25 .* (-4.0) .* u)
+        pred = exp(sm) * sqrt(p.total_volume) .* exp.(0.25 .* (-4.0) .* u) .*
+               varinf_scale(p)
         @test A0[2:end] ≈ pred[2:end]
         # A normal slope prior must admit negative slopes; a lognormal could not.
         @test cfg.slope_mean == -4.0
@@ -121,7 +145,35 @@ ln_params(m, s) = (log(m) - log1p((s / m)^2) / 2, sqrt(log1p((s / m)^2)))
                 loglogslope_prior=(-4.0, 1.0))
         a = matern_amplitude(0.2, 0.1, -0.3, MaternConfig(; kw..., kind=:amplitude), p)
         q = matern_amplitude(0.2, 0.1, -0.3, MaternConfig(; kw..., kind=:power), p)
-        @test q ≈ sqrt.(a)
+        # `:power` square-roots the spectrum in NIFTy's convention, and the
+        # conversion to VarInf's multiplies the final amplitude by `scl`. sqrt
+        # does not commute with that, so the clean `q == sqrt(a)` holds once both
+        # are put back in NIFTy's convention:
+        scl = varinf_scale(p)
+        @test q[2:end] ./ scl ≈ sqrt.(a[2:end] ./ scl)
+        @test q[1] ≈ a[1]                       # shared N placeholder
+    end
+
+    # The point of converting the convention: the field std implied by VarInf's
+    # `ifft` synthesis (divide by N) must equal NIFTy's own (divide by
+    # total_volume) for the SAME amplitude. Before the conversion these differed
+    # by `total_volume/sqrt(N)` -- 16x at dx=1, 1/16x at dx=1/16 -- so Matérn
+    # could not be dropped into `CorrelatedField`. Deterministic, no sampling.
+    @testset "usable in VarInf's synthesis: std matches NIFTy's" begin
+        cfg = MaternConfig(; scale_prior=(1.0, 1e-6), cutoff_prior=(5.0, 1e-6),
+                             loglogslope_prior=(-4.0, 1e-6))
+        for g in (FourierGridInfo(16, 1/16), FourierGridInfo(16, 1.0),
+                  FourierGridInfo(16, 4.0),  Axis1DInfo(48, 1/23),
+                  Axis1DInfo(48, 1.0))
+            A = matern_amplitude(0.0, 0.0, 0.0, cfg, g)
+            N, tv = sum(g.mode_multiplicity), g.total_volume
+            pow(v) = sum(g.mode_multiplicity[b] * v[b]^2 for b in 2:length(v))
+            std_varinf = sqrt(pow(A) / N)                 # VarInf: ifft carries 1/N
+            std_nifty  = sqrt(pow(A .* (tv / sqrt(N)))) / tv   # NIFTy: 1/total_volume
+            @test std_varinf ≈ std_nifty rtol=1e-12
+            # And it is a real constraint: tv/sqrt(N) is far from 1 on these grids.
+            @test !(0.9 < tv / sqrt(N) < 1.1) || isapprox(tv, sqrt(N); rtol=0.2)
+        end
     end
 
     @testset "shape of the spectrum" begin
